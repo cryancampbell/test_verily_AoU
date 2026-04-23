@@ -1,0 +1,806 @@
+---
+title: "20260401_CRC_ancillary_metadata_exploration"
+output: html_document
+date: "2026-04-01"
+---
+
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+
+lapply(c('viridis', 'ggthemes', 'skimr', 'stringr', 'bigrquery', 'ggridges', 'ggalluvial'),
+       function(pkg_name) { if(! pkg_name %in% installed.packages()) { install.packages(pkg_name)} } )
+
+library(stringr)
+library(viridis)    # A nice color scheme for plots.
+library(ggthemes)   # Common themes to change the look and feel of plots.
+library(lubridate)  # Date library from the tidyverse.
+library(tidyverse)  # Data wrangling packages.
+library(bigrquery)  # Data extraction from Google BigQuery
+
+library(data.table)
+##library(zipcodeR) ### trying a different way
+
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(tidyr)
+library(stringr)
+library(ggalluvial)
+library(ggridges)
+library(scales)
+```
+
+
+```{r}
+#Sys.setenv(LD_LIBRARY_PATH = paste("/home/rstudio/local_libs/usr/lib/x86_64-linux-gnu", Sys.getenv("LD_LIBRARY_PATH"), sep = ":"))
+#library(units)
+
+# Manually load the system library first
+#dyn.load("/home/rstudio/local_libs/usr/lib/x86_64-linux-gnu/libudunits2.so.0")
+
+# Now try to load the R package
+#library(units)
+
+
+#library(sf)
+#library(tigris)
+```
+
+#conda install -c conda-forge r-sf r-units r-gdal
+
+```{r data import}
+
+ancillary_meta_data <- readRDS(file = "../data/ancillary_meta_data.RDS")
+
+iT2D_status <- readRDS(file = "../data/T2D_Status.RDS")
+
+ancillary_meta_data <- ancillary_meta_data |>
+  dplyr::left_join(iT2D_status, by = "person_id") |>
+  dplyr::mutate(sample = ifelse(T2D_Status == "Cohort", "cohort","case")) |>
+  dplyr::mutate(iT2D = ifelse(T2D_Status == "iT2D", "iT2D", "Other"))
+
+ancillary_meta_data
+
+ancillary_surveys <- readRDS(file = "../data/ancillary_survey_data.RDS")
+```
+
+
+```{r basic demographic tables}
+#Gender
+ancillary_meta_data |>
+  dplyr::mutate(gender = case_when(
+    gender == "Man"   ~ "Man",
+    gender == "Woman" ~ "Woman",
+    TRUE               ~ "Other" # This catches everything else
+  )) |>
+  dplyr::group_by(gender) |>
+  dplyr::summarise(n = n(),
+                   percent = 100 *n()/nrow(ancillary_meta_data)) |>
+  dplyr::arrange(desc(n))
+
+ancillary_meta_data |>
+  dplyr::mutate(gender = case_when(
+    gender == "Man"   ~ "Man",
+    gender == "Woman" ~ "Woman",
+    TRUE              ~ "Other"
+  )) |>
+  dplyr::group_by(iT2D, gender) |> # Added 'sample' here
+  dplyr::summarise(n = n(), .groups = "drop_last") |> 
+  dplyr::mutate(percent = 100 * n / sum(n)) |> # % within T2D/non-T2D
+  dplyr::arrange(iT2D, desc(n))
+
+ancillary_meta_data |>
+  dplyr::mutate(gender = case_when(
+    gender == "Man"   ~ "Man",
+    gender == "Woman" ~ "Woman",
+    TRUE              ~ "Other"
+  )) |>
+  # 1. Group by both to get counts
+  dplyr::group_by(iT2D, gender) |>
+  dplyr::summarise(n = n(), .groups = "drop_last") |>
+  # 2. Calculate percentage within the 'sample' group
+  dplyr::mutate(percent = round(100 * n / sum(n), 1)) |>
+  dplyr::ungroup() |>
+  # 3. Select only the columns we want to see in the final table
+  dplyr::select(gender, iT2D, percent) |>
+  # 4. Pivot the 'sample' column (T2D/non-T2D) into headers
+  tidyr::pivot_wider(names_from = iT2D, values_from = percent)
+
+
+#Sex
+ancillary_meta_data |>
+  dplyr::mutate(sex = case_when(
+    sex == "Male"   ~ "Male",
+    sex == "Female" ~ "Female",
+    TRUE               ~ "Other" # This catches everything else
+  )) |>
+  dplyr::group_by(sex) |>
+  dplyr::summarise(n = n(),
+                   percent = 100 *n()/nrow(ancillary_meta_data)) |>
+  dplyr::arrange(desc(n))
+
+#Genetic Sex
+ancillary_meta_data |>
+  dplyr::group_by(sex_pred_plink) |>
+  dplyr::summarise(n = n(),
+                   percent = 100 *n()/nrow(ancillary_meta_data)) |>
+  dplyr::arrange(desc(n))
+
+ancillary_meta_data |>
+  dplyr::group_by(iT2D, sex_pred_plink) |> # Added 'sample' here
+  dplyr::summarise(n = n(), .groups = "drop_last") |> 
+  dplyr::mutate(percent = 100 * n / sum(n)) |> # % within T2D/non-T2D
+  dplyr::arrange(iT2D, desc(n))
+
+ancillary_meta_data |>
+  # 1. Group by both to get counts
+  dplyr::group_by(iT2D, sex_pred_plink) |>
+  dplyr::summarise(n = n(), .groups = "drop_last") |>
+  # 2. Calculate percentage within the 'sample' group
+  dplyr::mutate(percent = round(100 * n / sum(n), 1)) |>
+  dplyr::ungroup() |>
+  # 3. Select only the columns we want to see in the final table
+  dplyr::select(sex_pred_plink, iT2D, percent) |>
+  # 4. Pivot the 'sample' column (T2D/non-T2D) into headers
+  tidyr::pivot_wider(names_from = iT2D, values_from = percent)
+
+
+
+
+# gender and sex combo
+ancillary_meta_data |>
+  dplyr::mutate(gender = case_when(
+    gender == "Man"   ~ "Man",
+    gender == "Woman" ~ "Woman",
+    TRUE               ~ "Other" # This catches everything else
+  )) |>
+  dplyr::mutate(sex = case_when(
+    sex == "Male"   ~ "Male",
+    sex == "Female" ~ "Female",
+    TRUE               ~ "Other" # This catches everything else
+  )) |>
+  dplyr::group_by(gender, sex) |>
+  dplyr::summarise(n = n(),
+                   percent = 100 *n()/nrow(ancillary_meta_data))
+
+# people who weren't M or F at birth
+ancillary_meta_data |>
+  dplyr::mutate(gender = case_when(
+    gender == "Man"   ~ "Man",
+    gender == "Woman" ~ "Woman",
+    TRUE               ~ "Other" # This catches everything else
+  )) |>
+  dplyr::mutate(sex_simple = case_when(
+    sex == "Male"   ~ "Male",
+    sex == "Female" ~ "Female",
+    TRUE               ~ "Other" # This catches everything else
+  )) |>
+  dplyr::filter(sex_simple == "Other") |>
+  dplyr::group_by(gender, sex, sex_pred_plink) |>
+  dplyr::summarise(n = n()) |>
+  dplyr::arrange(desc(n))
+
+# everyone listed the "correct" sex at birth
+# no genetic M listed F at birth, and vice versa
+ancillary_meta_data |>
+  dplyr::mutate(gender = case_when(
+    gender == "Man"   ~ "Man",
+    gender == "Woman" ~ "Woman",
+    TRUE               ~ "Other" # This catches everything else
+  )) |>
+  dplyr::mutate(sex = case_when(
+    sex == "Male"   ~ "Male",
+    sex == "Female" ~ "Female",
+    TRUE               ~ "Other" # This catches everything else
+  )) |>
+  dplyr::group_by(sex, sex_pred_plink) |>
+  dplyr::summarise(n = n(),
+                   percent = 100 *n()/nrow(ancillary_meta_data))
+
+#age
+ancillary_meta_data |>
+  dplyr::mutate(age_at_blood_draw = floor((date - dob) / 365.25)) |>
+  dplyr::filter(!is.na(age_at_blood_draw)) |>
+  ggplot(aes(x = age_at_blood_draw)) +
+  geom_histogram(binwidth = 2) +
+  theme_minimal()
+
+ancillary_meta_data |>
+  dplyr::mutate(age_at_blood_draw = floor((date - dob) / 365.25)) |>
+  dplyr::filter(!is.na(age_at_blood_draw)) |> 
+  dplyr::filter(gender %in% c("Man", "Woman")) |>
+  ggplot(aes(x = age_at_blood_draw, fill = gender)) +
+    geom_histogram(binwidth = 2, position = "identity", alpha = 0.4) +
+    theme_minimal()
+
+ancillary_meta_data |>
+  dplyr::mutate(age_at_blood_draw = floor((date - dob) / 365.25)) |>
+  dplyr::filter(!is.na(age_at_blood_draw)) |> 
+  ggplot(aes(x = age_at_blood_draw, fill = T2D_Status)) +
+    geom_histogram(binwidth = 2, position = "identity", alpha = 0.4) +
+    theme_minimal()
+
+ancillary_meta_data |>
+  dplyr::mutate(age_at_blood_draw = floor((date - dob) / 365.25)) |>
+  dplyr::filter(!is.na(age_at_blood_draw)) |> 
+  ggplot(aes(x = age_at_blood_draw, fill = iT2D)) +
+    geom_histogram(binwidth = 2, position = "identity", alpha = 0.4) +
+    theme_minimal()
+
+#race/strata
+#survey breakdown
+ancillary_meta_data |>
+  dplyr::mutate(race_eth = ifelse(ethnicity == "Hispanic or Latino" & race %in% c("White", "Black or African American", "None Indicated"), 
+                                  "Hispanic", race)) |>
+  dplyr::group_by(race_eth) |>
+  dplyr::summarise(n = n(),
+                   percent = 100 * n() / nrow(ancillary_meta_data)) |>
+  dplyr::arrange(desc(n))
+
+### keep top 4 groups, and check iT2D
+ancillary_meta_data |>
+  dplyr::mutate(race_eth = ifelse(ethnicity == "Hispanic or Latino" & race %in% c("White", "Black or African American", "None Indicated"), 
+                                  "Hispanic", race)) |>
+  dplyr::filter(race_eth %in% c("White","Hispanic","Asian","Black or African American")) |>
+  dplyr::group_by(race_eth, iT2D) |>
+    dplyr::summarise(sample_count = n()) |>
+  dplyr::mutate(sample_pct = (sample_count / sum(sample_count)) * 100)
+
+
+#ancestry prediction breakdown
+ancillary_meta_data |>
+  dplyr::mutate(race_eth = ifelse(ethnicity == "Hispanic or Latino" & race %in% c("White", "Black or African American", "None Indicated"), 
+                                  "Hispanic", race)) |>
+  dplyr::group_by(ancestry_pred) |>
+  dplyr::summarise(n = n(),
+                   percent = 100 * n() / nrow(ancillary_meta_data)) |>
+  dplyr::arrange(desc(n))
+
+#cross match genetic & survey
+ancillary_meta_data |>
+  dplyr::mutate(race_eth = ifelse(ethnicity == "Hispanic or Latino" & race %in% c("White", "Black or African American", "None Indicated"), 
+                                  "Hispanic", race)) |>
+  dplyr::group_by(race_eth, ancestry_pred) |>
+  dplyr::summarise(n = n(),
+                   percent = 100 * n() / nrow(ancillary_meta_data)) |>
+  dplyr::arrange(desc(n))
+
+#biggest gap is in those who listed Hisp but are genetically afr
+#lets break those down
+ancillary_meta_data |>
+  dplyr::mutate(race_eth = ifelse(ethnicity == "Hispanic or Latino" & race %in% c("White", "Black or African American", "None Indicated"), 
+                                  "Hispanic", race)) |>
+  dplyr::filter(race_eth == "Hispanic" & ancestry_pred == "afr") |>
+  dplyr::group_by(race) |>
+  dplyr::summarise(n = n()) |>
+  dplyr::mutate(percent = round(100 * n / sum(n), digits = 1)) |> # sum(n) is the total of filtered rows
+  dplyr::arrange(desc(n))
+
+ancillary_meta_data |>
+  # 1. Standardize your race_eth logic
+  dplyr::mutate(race_eth = ifelse(ethnicity == "Hispanic or Latino" & 
+                                  race %in% c("White", "Black or African American", "None Indicated"), 
+                                  "Hispanic", race)) |>
+  dplyr::filter(!race_eth %in% c("Skip",
+                                 "None of these",
+                                 "I prefer not to answer",
+                                 "More than one population",
+                                 "Native Hawaiian or Other Pacific Islander")) |>
+  # 2. Group and count
+  dplyr::count(race_eth, ancestry_pred) |>
+  # 3. Plot
+  ggplot(aes(y = n, axis1 = race_eth, axis2 = ancestry_pred)) +
+  geom_alluvium(aes(fill = race_eth), width = 1/12) +
+  geom_stratum(width = 1/12, fill = "grey90", color = "grey") +
+  geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 3) +
+  scale_x_discrete(limits = c("Survey Response", "Genetic Ancestry"), expand = c(.05, .05)) +
+  scale_fill_viridis_d(option = "mako") + # Nice color palette
+  theme_minimal() +
+  labs(title = "Self-Reported Race vs. Genetic Ancestry",
+       y = "Number of Participants") +
+  theme(legend.position = "none")
+
+ancillary_meta_data |>
+  dplyr::mutate(race_eth = ifelse(ethnicity == "Hispanic or Latino" & 
+                                  race %in% c("White", "Black or African American", "None Indicated"), 
+                                  "Hispanic", race),
+                # Manually set the order for the Y-axis
+                race_eth = forcats::fct_relevel(race_eth,
+                                                "White",
+                                                "Black or African American",
+                                                "Asian",
+                                                "Hispanic",
+                                                "Middle Eastern or North African",
+                                                "Native Hawaiian or Other Pacific Islander",
+                                                "More than one population",
+                                                "None of these"),
+                # Manually set the order for the X-axis
+                ancestry_pred = forcats::fct_relevel(ancestry_pred, "eur", "afr", "eas", "sas", "amr", "mid")) |>
+  dplyr::filter(!race_eth %in% c("Skip",
+                                 "I prefer not to answer")) |>
+  dplyr::count(race_eth, ancestry_pred) |>
+  # Calculate percentage within each Survey Group
+  dplyr::group_by(race_eth) |>
+  dplyr::mutate(pct = n / sum(n) * 100) |> 
+  ggplot(aes(x = ancestry_pred, y = race_eth, fill = pct)) +
+  geom_tile() +
+  geom_text(aes(label = round(pct, 1)), size = 3) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  theme_minimal() +
+  labs(title = "Genetic Ancestry % by Survey Response",
+       x = "Predicted Genetic Ancestry",
+       y = "Survey Race/Ethnicity",
+       fill = "% of Group")
+
+#census/geog
+# --- STEP 1: Filter and Setup Reference Data ---
+# Reference: 2024 US Census Population by Region (in millions)
+census_pop <- data.frame(
+  region = c("NE", "MW", "S", "W"),
+  pop_millions = c(57.9, 69.5, 132.7, 79.9)
+) %>%
+  mutate(pop_pct = (pop_millions / sum(pop_millions)) * 100)
+
+# --- STEP 2: Compare Dataset vs. US Population ---
+regional_counts <- ancillary_meta_data |>
+  dplyr::filter(region != "Unknown") |>
+  dplyr::group_by(region) |>
+  dplyr::summarise(sample_count = n()) |>
+  dplyr::mutate(sample_pct = (sample_count / sum(sample_count)) * 100) |>
+  dplyr::left_join(census_pop, by = "region")
+
+print("Regional Distribution Comparison:")
+print(regional_counts)
+
+regional_counts_w_t2d <- ancillary_meta_data |>
+  dplyr::filter(region != "Unknown") |>
+  dplyr::group_by(region, iT2D) |>
+  dplyr::summarise(sample_count = n()) |>
+  dplyr::mutate(sample_pct = (sample_count / sum(sample_count)) * 100)
+
+print("Regional Distribution Comparison w/T2D:")
+print(regional_counts_w_t2d)
+
+
+#SDOH
+#income table
+ancillary_meta_data |>
+  dplyr::mutate(annual_household_income = forcats::fct_relevel(annual_household_income,
+    "Skip",
+    "Prefer Not To Answer",
+    "less 10k",
+    "10k 25k",
+    "25k 35k",
+    "35k 50k",
+    "50k 75k",
+    "75k 100k",
+    "100k 150k",
+    "150k 200k",
+    "more 200k"
+  )) |>
+    dplyr::filter(!annual_household_income %in% c("Skip","Prefer Not To Answer")) |>
+  dplyr::group_by(annual_household_income) |>
+  dplyr::summarise(n = n()) |>
+  dplyr::mutate(percent = round(100 * n / sum(n), digits = 1))
+
+#education table
+ancillary_meta_data |>
+  dplyr::mutate(highest_edu = forcats::fct_relevel(highest_edu,
+    "Skip",
+    "Prefer Not To Answer",
+    "Never Attended",
+    "One Through Four",
+    "Five Through Eight",
+    "Nine Through Eleven",
+    "Twelve Or GED",
+    "College One to Three",
+    "College Graduate",
+    "Advanced Degree")) |>
+  dplyr::filter(!highest_edu %in% c("Skip","Prefer Not To Answer")) |>
+  dplyr::group_by(highest_edu) |>
+  dplyr::summarise(n = n()) |>
+  dplyr::mutate(percent = round(100 * n / sum(n), digits = 1))
+
+ancillary_meta_data |>
+  dplyr::mutate(highest_edu = forcats::fct_relevel(highest_edu, 
+    "Skip",
+    "Prefer Not To Answer",
+    "Never Attended",
+    "One Through Four",
+    "Five Through Eight",
+    "Nine Through Eleven",
+    "Twelve Or GED",
+    "College One to Three",
+    "College Graduate",
+    "Advanced Degree"
+  )) |>
+  dplyr::filter(!highest_edu %in% c("Skip","Prefer Not To Answer")) |>
+  dplyr::group_by(highest_edu, iT2D) |>
+  dplyr::summarise(n = n()) |>
+  dplyr::mutate(percent = round(100 * n / sum(n), digits = 1))
+
+#heatmap
+ancillary_meta_data |>
+  # 1. Re-level both factors for logical order
+  mutate(
+    education = fct_relevel(highest_edu,
+                            "Skip",
+    "Prefer Not To Answer",
+    "Never Attended",
+    "One Through Four",
+    "Five Through Eight",
+    "Nine Through Eleven",
+    "Twelve Or GED",
+    "College One to Three",
+    "College Graduate",
+    "Advanced Degree"),
+    income = fct_relevel(annual_household_income, 
+      "Skip",
+    "Prefer Not To Answer",
+    "less 10k",
+    "10k 25k",
+    "25k 35k",
+    "35k 50k",
+    "50k 75k",
+    "75k 100k",
+    "100k 150k",
+    "150k 200k",
+    "more 200k")
+  ) |>
+  # 2. Calculate percentages within each Education level
+  count(education, income) |>
+  group_by(education) |>
+  mutate(pct = (n / sum(n)) * 100) |>
+  ungroup() |>
+  # 3. Plot
+ ggplot(aes(x = income, y = education, fill = pct)) +
+  geom_tile(color = "white") +
+  # 2. Dynamic Text Color & Rounding
+  # We use round(pct, 0) to turn 0.04% into 0%
+  # We use color = pct > 40 to flip text to white on dark tiles
+  geom_text(aes(
+    label = paste0(round(pct, 1), "%"), 
+    color = pct > 40 
+  ), size = 3) +
+  # 3. Define the colors for the text logic
+  scale_color_manual(values = c("TRUE" = "white", "FALSE" = "black"), guide = "none") +
+  scale_fill_viridis_c(option = "magma", direction = -1) + 
+  theme_minimal() +
+  labs(
+    title = "Income Distribution by Education Level",
+    subtitle = "Text flips to white at >40% density for readability",
+    x = "Annual Household Income",
+    y = "Education Level",
+    fill = "% of Group"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+#heatmap without skips
+ancillary_meta_data |>
+  # 1. Re-level both factors for logical order
+  mutate(
+    education = fct_relevel(highest_edu,
+                            "Skip",
+    "Prefer Not To Answer",
+    "Never Attended",
+    "One Through Four",
+    "Five Through Eight",
+    "Nine Through Eleven",
+    "Twelve Or GED",
+    "College One to Three",
+    "College Graduate",
+    "Advanced Degree"),
+    income = fct_relevel(annual_household_income, 
+      "Skip",
+    "Prefer Not To Answer",
+    "less 10k",
+    "10k 25k",
+    "25k 35k",
+    "35k 50k",
+    "50k 75k",
+    "75k 100k",
+    "100k 150k",
+    "150k 200k",
+    "more 200k")
+  ) |>
+  dplyr::filter(!highest_edu %in% c("Skip","Prefer Not To Answer")) |>
+  dplyr::filter(!annual_household_income %in% c("Skip","Prefer Not To Answer")) |>
+  # 2. Calculate percentages within each Education level
+  count(education, income) |>
+  group_by(education) |>
+  mutate(pct = (n / sum(n)) * 100) |>
+  ungroup() |>
+  # 3. Plot
+ ggplot(aes(x = income, y = education, fill = pct)) +
+  geom_tile(color = "white") +
+  # 2. Dynamic Text Color & Rounding
+  # We use round(pct, 0) to turn 0.04% into 0%
+  # We use color = pct > 40 to flip text to white on dark tiles
+  geom_text(aes(
+    label = paste0(round(pct, 1), "%"), 
+    color = pct > 40 
+  ), size = 3) +
+  # 3. Define the colors for the text logic
+  scale_color_manual(values = c("TRUE" = "white", "FALSE" = "black"), guide = "none") +
+  scale_fill_viridis_c(option = "magma", direction = -1) + 
+  theme_minimal() +
+  labs(
+    title = "Income Distribution by Education Level",
+    subtitle = "Text flips to white at >40% density for readability",
+    x = "Annual Household Income",
+    y = "Education Level",
+    fill = "% of Group"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+#how many people have either skip or no response on one or both?
+ancillary_meta_data |>
+  dplyr::filter(region != "Unknown") |>
+  dplyr::mutate(
+    no_edu = highest_edu %in% c("Skip", "Prefer Not To Answer") | is.na(highest_edu),
+    no_inc = annual_household_income %in% c("Skip", "Prefer Not To Answer") | is.na(annual_household_income)
+  ) |>
+  dplyr::filter(no_edu | no_inc) |> 
+  dplyr::summarise(
+    total_with_any_skip = n(),
+    skipped_education_only = sum(no_edu & !no_inc),
+    skipped_income_only = sum(!no_edu & no_inc),
+    skipped_both = sum(no_edu & no_inc)
+  )
+
+
+```
+
+
+```{r skipped sdoh side quest}
+ancillary_meta_data |>
+  dplyr::filter(region != "Unknown") |>
+ dplyr::mutate(
+    no_edu = highest_edu %in% c("Skip", "Prefer Not To Answer") | is.na(highest_edu),
+    no_inc = annual_household_income %in% c("Skip", "Prefer Not To Answer") | is.na(annual_household_income)
+  ) |>
+  dplyr::group_by(region) |> 
+  dplyr::summarise(
+    total_n = n(),
+    any_skip_n = sum(no_edu | no_inc),
+    inc_skip_n = sum(no_inc),
+    edu_skip_n = sum(no_edu),
+    # Calculate the percentage of that region's total that skipped
+    percent_inc_skipped = (inc_skip_n / total_n) * 100
+  ) |>
+  dplyr::arrange(desc(percent_inc_skipped))
+
+ancillary_meta_data |>
+  dplyr::filter(region != "Unknown") |>
+  dplyr::group_by(region) |>
+  dplyr::summarise(
+    total_n = n(),
+    under_50k_n = sum(annual_household_income %in% c("less 10k", "10k 25k", "25k 35k", "35k 50k")),
+    fraction = under_50k_n / total_n,
+    percent = fraction * 100
+  ) |>
+  dplyr::arrange(desc(percent))
+
+```
+
+```{r age sex and race}
+
+ancillary_meta_data |>
+    dplyr::mutate(race_eth = ifelse(ethnicity == "Hispanic or Latino" & race %in% c("White", "Black or African American", "None Indicated"), 
+                                  "Hispanic", race)) |>
+  dplyr::filter(race_eth %in% c("White",
+                                "Black or African American",
+                                "Hispanic",
+                                "Asian")) |>
+  dplyr::mutate(
+    age = as.numeric(date - dob) / 365.25,
+    sex_genetic = if_else(sex_pred_plink %in% c("M", "F"), sex_pred_plink, "Other")
+  ) |>
+  dplyr::filter(!is.na(age), !is.na(race_eth), sex_genetic != "Other") |>
+  ggplot(aes(x = age, y = race_eth, fill = sex_genetic)) +
+  # 'alpha' makes the overlapping densities transparent
+  geom_density_ridges(alpha = 0.6, scale = 0.9, color = "white") +
+  theme_minimal() +
+  scale_fill_manual(values = c("M" = "#0072B2", "F" = "#D55E00")) +
+  labs(
+    title = "Age Distribution by Race and Gender",
+    x = "Age (Years)",
+    y = "Self-Reported Race/Eth",
+    fill = "Gender"
+  ) +
+  theme(legend.position = "bottom")
+
+
+ancillary_meta_data |>
+    dplyr::mutate(race_eth = ifelse(ethnicity == "Hispanic or Latino" & race %in% c("White", "Black or African American", "None Indicated"), 
+                                  "Hispanic", race)) |>
+  dplyr::filter(race_eth %in% c("White",
+                                "Black or African American",
+                                "Hispanic",
+                                "Asian")) |>
+  dplyr::mutate(
+    age = as.numeric(date - dob) / 365.25,
+    sex_genetic = if_else(sex_pred_plink %in% c("M", "F"), sex_pred_plink, "Other")
+  ) |>
+  dplyr::filter(!is.na(age), !is.na(race_eth)) |>
+  ggplot(aes(x = age, y = race_eth, fill = iT2D)) +
+  # 'alpha' makes the overlapping densities transparent
+  geom_density_ridges(alpha = 0.6, scale = 0.9, color = "white") +
+  theme_minimal() +
+  scale_fill_manual(values = c("iT2D" = "#0072B2", "Other" = "#D55E00")) +
+  labs(
+    title = "Age Distribution by Race and Gender",
+    x = "Age (Years)",
+    y = "Self-Reported Race/Eth",
+    fill = "Gender"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+```{r zips on a map}
+
+```
+
+Possible questions for metabolite QC
+```{r metabolite qc}
+q_list <- unique(ancillary_surveys$T_DISP_question)
+
+q_list[grepl("preg", q_list)]
+q_list[grepl("period", q_list)]
+
+#smoking/noicotine
+"Do you now smoke cigarettes every day, some days, or not at all?"
+"Have you smoked at least 100 cigarettes in your entire life? (There are 20 cigarettes in a pack.)"
+"On average, how many cigarettes do you smoke per day now? (There are 20 cigarettes in a pack.)"
+
+#reproductive
+"Have you ever had a hysterectomy (that is, surgery to remove your uterus or womb)?"                                  
+"Have you ever had an ovary removed?"
+"Have your menstrual periods stopped permanently?"
+
+"Are you currently pregnant?"
+
+
+#drugs
+"In the PAST THREE MONTHS, how often have you used Sedatives or sleeping pills for non-medical reasons (Valium, Serepax, Ativan, Xanax, Librium, Rohypnol, GHB, etc.)"  
+"In the PAST THREE MONTHS, how often have you used Street opioids (heroin, opium, etc.)"
+"In the PAST THREE MONTHS, how often have you used Prescription opioids for non-medical reasons (obana, fentanyl, oxycodone [OxyContin, Percocet], hydrocodone [Vicodin], methadone, buprenorphine [Supoxone], etc.)"
+
+q_text <- "Do you now smoke cigarettes every day, some days, or not at all?"
+
+all_q <- c("Do you now smoke cigarettes every day, some days, or not at all?",
+           "Have you smoked at least 100 cigarettes in your entire life? (There are 20 cigarettes in a pack.)",
+           "On average, how many cigarettes do you smoke per day now? (There are 20 cigarettes in a pack.)",
+           "Have you ever had a hysterectomy (that is, surgery to remove your uterus or womb)?",
+           "Have you ever had an ovary removed?",
+           "Have your menstrual periods stopped permanently?",
+           "Are you currently pregnant?",
+           "In the PAST THREE MONTHS, how often have you used Sedatives or sleeping pills for non-medical reasons (Valium, Serepax, Ativan, Xanax, Librium, Rohypnol, GHB, etc.)",
+           "In the PAST THREE MONTHS, how often have you used Street opioids (heroin, opium, etc.)",
+           "In the PAST THREE MONTHS, how often have you used Prescription opioids for non-medical reasons (obana, fentanyl, oxycodone [OxyContin, Percocet], hydrocodone [Vicodin], methadone, buprenorphine [Supoxone], etc.)")
+
+for (q in 1:length(all_q)) {
+
+    q_text <- all_q[q]
+    
+    resp_count <- ancillary_surveys |>
+      dplyr::filter(T_DISP_question == q_text) |>
+      dplyr::group_by(T_DISP_answer) |>
+      dplyr::summarise(n = n()) |>
+      dplyr::mutate(percent = round(100 * n / sum(n), digits = 1),
+                    q = q_text) |>
+      dplyr::arrange(desc(n))
+
+    print(resp_count)
+}
+
+```
+
+how close are the survey and blood draw dates?
+```{r}
+colnames(ancillary_meta_data)
+
+table(ancillary_surveys$T_DISP_survey)
+table(ancillary_surveys$T_DISP_survey_version)
+
+ancillary_surveys |>
+  dplyr::select(person_id, T_DISP_survey_version, survey_datetime) |>
+  dplyr::filter(T_DISP_survey_version %in% c("The Basics",
+                                             "Lifestyle",
+                                             "Overall Health")) |>
+  dplyr::distinct() |>
+  dplyr::arrange(person_id) |>
+  dplyr::mutate(survey_date = as.Date(survey_datetime)) |>
+  dplyr::select(person_id, survey_date) |>
+  dplyr::distinct()
+
+ancillary_surveys |>
+  dplyr::select(person_id, T_DISP_survey_version, survey_datetime) |>
+  dplyr::filter(T_DISP_survey_version %in% c("The Basics",
+                                             "Lifestyle",
+                                             "Overall Health")) |>
+  dplyr::distinct() |>
+  dplyr::filter(person_id == 1002261)
+
+
+#for each survey, lets compare the date with the blood draw date
+survey_diffs <- ancillary_surveys |>
+  dplyr::mutate(survey_date = as.Date(survey_datetime)) |>
+  dplyr::select(person_id, T_DISP_survey_version, survey_date) |>
+  dplyr::filter(T_DISP_survey_version %in% c("The Basics",
+                                             "Lifestyle",
+                                             "Overall Health")) |>
+  dplyr::distinct() |>
+  dplyr::left_join(iT2D_status |>
+                     dplyr::select(person_id, Blood_Draw, T2D_Status),
+                   by = "person_id") |>
+  dplyr::mutate(time_diff = Blood_Draw - survey_date)
+
+
+ggplot(data = survey_diffs, aes(x = abs(as.numeric(time_diff)))) +
+  geom_histogram(bins = 100, fill = "steelblue", color = "white") +
+  #scale_y_log10() +
+  coord_cartesian(ylim = c(1, NA)) + # Forces the floor to start at 1 (10^0)
+  theme_minimal()
+
+ggplot(data = survey_diffs, aes(x = abs(as.numeric(time_diff)))) +
+  geom_histogram(bins = 100, fill = "steelblue", color = "white") +
+  scale_y_log10() +
+  coord_cartesian(ylim = c(1, NA)) + # Forces the floor to start at 1 (10^0)
+  theme_minimal()
+
+#max of each individual
+survey_diffs %>%
+  # 1. Group by person and find their individual max difference
+  group_by(person_id) %>%
+  summarize(max_diff = max(abs(as.numeric(time_diff)), na.rm = TRUE),
+            T_DISP_survey_version = first(T_DISP_survey_version)) %>% 
+  # 2. Pass this summarized data into ggplot
+  ggplot(aes(x = max_diff)) +
+  geom_histogram(bins = 100, color = "white") +
+  scale_y_log10() +
+  coord_cartesian(ylim = c(1, NA)) +
+  theme_minimal() +
+  labs(x = "Maximum Absolute Day Difference (Per Person)", 
+       y = "Count of People (Log Scale)")
+
+#how many are within +/- 1 week
+mean(abs(survey_diffs$time_diff) <= 7)
+mean(abs(survey_diffs$time_diff) <= 28)
+
+ggplot(data = survey_diffs, 
+       aes(x = abs(as.numeric(time_diff)), fill = T_DISP_survey_version)) +
+  geom_histogram(bins = 100, color = "white") +
+  scale_y_log10() +
+  coord_cartesian(ylim = c(1, NA)) +
+  facet_wrap(~T_DISP_survey_version, ncol = 1) + # Stack them vertically
+  theme_minimal() +
+  theme(legend.position = "none") # Hide legend since titles are on the boxes
+
+
+survey_summary <- survey_diffs %>%
+  # Convert to numeric once at the start
+  mutate(days = abs(as.numeric(time_diff))) %>%
+  group_by(T_DISP_survey_version) %>%
+  summarize(
+    total_n = n(),
+    within_1_week = mean(days <= 7, na.rm = TRUE) * 100,
+    within_4_weeks = mean(days <= 28, na.rm = TRUE) * 100
+  )
+
+print(survey_summary)
+
+survey_summary <- survey_diffs %>%
+  # Convert to numeric once at the start
+  mutate(days = abs(as.numeric(time_diff))) %>%
+  group_by(T2D_Status) %>%
+  summarize(
+    total_n = n(),
+    within_1_week = mean(days <= 7, na.rm = TRUE) * 100,
+    within_4_weeks = mean(days <= 28, na.rm = TRUE) * 100
+  )
+
+print(survey_summary)
+```
+

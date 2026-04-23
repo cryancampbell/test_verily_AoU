@@ -1,0 +1,360 @@
+---
+title: "20260415_CRC_metabolite_test"
+output: html_document
+date: "2026-04-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(purrr)
+library(dplyr)
+library(stringr)
+library(tidyverse)
+library(ggplot2)
+library(broom)
+```
+
+```{r handling function}
+parse_mz_rt_exact <- function(exposure) {
+  exposure_core <- exposure |>
+    str_remove("^[^_]+_[^_]+__") |>
+    str_remove("__dup\\d+$")
+
+  ends_mz_n <- str_detect(exposure_core, "(m/z|n)$")
+
+  nums_list <- str_extract_all(exposure_core, "\\d+\\.?\\d*") |>
+    map(as.numeric)
+
+  mz <- map2_dbl(nums_list, ends_mz_n, function(nums, end_flag) {
+    if (length(nums) == 0) return(NA_real_)
+
+    if (end_flag) {
+      return(dplyr::last(nums))
+    }
+
+    if (length(nums) >= 2) {
+      first_num <- nums[1]
+      second_num <- nums[2]
+
+      if (!is.na(first_num) && first_num < 20 && second_num >= 20) {
+        return(second_num)
+      }
+
+      return(first_num)
+    }
+
+    nums[1]
+  })
+
+  rt <- map2_dbl(nums_list, ends_mz_n, function(nums, end_flag) {
+    if (length(nums) == 0) return(NA_real_)
+
+    if (end_flag) {
+      return(if (length(nums) >= 2) nums[1] else NA_real_)
+    }
+
+    if (length(nums) >= 2) {
+      first_num <- nums[1]
+      second_num <- nums[2]
+
+      if (!is.na(first_num) && first_num < 20 && second_num >= 20) {
+        return(first_num)
+      }
+
+      return(second_num)
+    }
+
+    NA_real_
+  })
+
+  tibble(mz = mz, rt = rt)
+}
+```
+
+# Import Ancillary Data
+```{r}
+ancillary_meta_data <- readRDS("../data/ancillary_meta_data.RDS")
+```
+
+
+# Import metabolite data
+```{r data}
+date()
+
+ccreoh <- fread("../../Can_we_see_it/CCREOH_ST002118_AN003466_Analytical_Dataset.csv")
+
+# 1. Pivot the metabolite columns into a long format
+ccreoh_long <- ccreoh |>
+  pivot_longer(
+    cols = starts_with("ST002118"), # Selects all columns starting with your study ID
+    names_to = "exposure",          # Moves column names into a new column called "exposure"
+    values_to = "intensity"         # Moves the actual numeric data into "intensity"
+  )
+
+# 2. Use the handling function (D LLoyd) to extract m/z and RT
+# We use mutate + unpack to keep everything aligned in one data frame
+ccreoh_cleaned <- ccreoh_long |>
+  mutate(parsed = parse_mz_rt_exact(exposure)) |>
+  unpack(parsed)
+
+#remove columns with NA's
+empty_cols <- ccreoh_cleaned |>
+  summarise(across(everything(), ~ all(is.na(.)))) |>
+  pivot_longer(everything()) |>
+  filter(value == TRUE) |>
+  pull(name)
+
+#what will be dropped
+print(empty_cols)
+
+ccreoh_cleaned <- ccreoh_cleaned |>
+  select(where(~ !all(is.na(.))))
+
+head(ccreoh_cleaned)
+
+# Pull out metadata
+ccreoh_sample_table <- ccreoh_cleaned |>
+  dplyr::select(-intensity,
+                -exposure,
+                -mz,
+                -rt) |>
+  dplyr::distinct()
+
+#example, pull out a few peaks:
+#0.41_113.0209 from everyone
+ccreoh_cleaned |>
+  dplyr::filter(mz == 113.0209 & rt == 0.41)
+
+ccreoh_cleaned |>
+  dplyr::filter(mz == 113.0209 & rt == 0.41) |>
+  ggplot(aes(x = intensity)) +
+  geom_histogram() +
+  theme_minimal() +
+  ggtitle("0.41_113.0209")
+
+#ST002118_AN003466__0.72_117.0738m
+ccreoh_cleaned |>
+  dplyr::filter(mz == 117.0738 & rt == 0.72)
+
+ccreoh_cleaned |>
+  dplyr::filter(mz == 117.0738 & rt == 0.72) |>
+  ggplot(aes(x = intensity)) +
+  geom_histogram() +
+  theme_minimal() +
+  ggtitle("0.72_117.0738m/z")
+date()
+```
+
+#Generate Fake Ancillary Metabolite Data
+```{r}
+#pick 1,000 peaks
+set.seed(1212) # For reproducibility
+sample_peaks <- ccreoh_cleaned |>
+  dplyr::select(exposure, mz, rt) |>
+  dplyr::filter(!grepl("n", exposure)) |>
+  dplyr::distinct() |>
+  dplyr::slice_sample(n=1000)
+
+sample_table <- ancillary_meta_data |>
+  dplyr::mutate(pid = person_id,
+                year = str_extract(observation_datetime_utc, "^\\d{4}")) |>
+  dplyr::select(pid, year, sex, self_report)
+
+```
+
+```{r}
+# 1. Prepare the reference parameters from ccreoh_cleaned
+# measure the parameters of each peak based on real observations
+peak_logic <- ccreoh_cleaned |>
+  filter(exposure %in% sample_peaks$exposure) |>
+  group_by(exposure) |>
+  summarise(
+    # Calculate the proportion of values that are ZERO
+    prop_zero = sum(intensity == 0, na.rm = TRUE) / n(),
+    # Distribution stats (only for the actual signals > 0)
+    log_mean = mean(log(intensity[intensity > 0]), na.rm = TRUE),
+    log_sd   = sd(log(intensity[intensity > 0]), na.rm = TRUE),
+    .groups  = "drop")
+
+set.seed(1212) # For reproducibility
+dummy_peak_file <- sample_table |>
+  select(pid) |>
+  cross_join(peak_logic) |>
+  # Randomly decide if this person gets a 0 based on that peak's zero-rate
+  mutate(is_zero = rbinom(n(), 1, prop_zero),
+    # If is_zero is 1, return 0. Otherwise, pull from log-normal.
+    fake_intensity = if_else(is_zero == 1, 0, exp(rnorm(n(), mean = log_mean, sd = log_sd)))) |>
+  select(pid, exposure, intensity = fake_intensity)
+
+
+# Compare means of non-NA values
+stats_compare <- bind_rows(ccreoh_cleaned |> 
+                             filter(exposure %in% sample_peaks$exposure) |>
+                             mutate(source = "Real"),
+                           dummy_peak_file |>
+                             mutate(source = "Dummy")) |>
+  group_by(exposure, source) |>
+  summarise(mean_int = mean(intensity, na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = source, values_from = mean_int)
+
+ggplot(stats_compare, aes(x = Real, y = Dummy)) +
+  geom_point(alpha = 0.5, color = "darkgreen") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  scale_x_log10() + scale_y_log10() +
+  theme_minimal() +
+  labs(title = "Correlation between Peak Means (Log-Normal Fix)")
+
+zero_compare <- bind_rows(
+  ccreoh_cleaned |> filter(exposure %in% sample_peaks$exposure) |> mutate(source = "Real"),
+  dummy_peak_file |> mutate(source = "Dummy")
+) |>
+  group_by(exposure, source) |>
+  summarise(zero_count = sum(intensity == 0), .groups = "drop") |>
+  pivot_wider(names_from = source, values_from = zero_count) |>
+  dplyr::mutate(Dummy_Per_Sample = Dummy / dim(ancillary_meta_data)[1],
+                Real_Per_Sample = Real / dim(ccreoh)[1])
+
+ggplot(zero_compare, aes(x = Real_Per_Sample,
+                         y = Dummy_Per_Sample)) +
+  geom_point(alpha = 0.5, color = "orange") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Count of Zero Values (0) per Peak",
+       x = "Actual Zeros per Sample", y = "Synthetic Zeros per Sample")
+
+dummy_peak_file_wide <- dummy_peak_file |>
+  pivot_wider(names_from = exposure, values_from = intensity)
+
+# Tag the data sources and combine
+comparison_df <- bind_rows(
+  ccreoh_cleaned |>
+    filter(exposure %in% sample_peaks$exposure) |>
+    select(exposure, intensity) |>
+    mutate(source = "Real"),
+    
+  dummy_peak_file |>
+    select(exposure, intensity) |>
+    mutate(source = "Dummy")
+)
+
+ggplot(comparison_df, aes(x = intensity, fill = source)) +
+  geom_density(alpha = 0.5) +
+  scale_x_log10() + # Metabolomics data is almost always better viewed on log scale
+  theme_minimal() +
+  labs(title = "Global Distribution: Real vs. Dummy Data",
+       x = "Intensity (Log10 Scale)",
+       y = "Density")
+
+# 1. Capture the constant sample size
+target_n <- dim(ccreoh)[1]
+
+# 2. Downsample the dummy data
+dummy_downsampled <- dummy_peak_file |>
+  group_by(exposure) |>
+  # Now that target_n is a single number (a constant), this works perfectly
+  slice_sample(n = target_n) |>
+  ungroup()
+
+# 3. Combine and Plot
+comparison_df <- bind_rows(
+  ccreoh_cleaned |> 
+    filter(exposure %in% sample_peaks$exposure) |> 
+    mutate(source = "Real"),
+    
+  dummy_downsampled |> 
+    mutate(source = "Dummy")
+)
+
+# 1. Pick 9 random exposure names from your list
+set.seed(1212) # So you see the same 9 peaks every time you run this
+subset_peaks <- sample(unique(comparison_df$exposure), 9)
+
+# 2. Filter and Plot
+comparison_df |>
+  filter(exposure %in% subset_peaks) |>
+  ggplot(aes(x = intensity, fill = source)) +
+  geom_histogram(alpha = 0.5, position = "identity", bins = 30) +
+  scale_x_log10() + 
+  facet_wrap(~exposure, scales = "free", ncol = 3) + # Forces a nice 3x3 grid
+  theme_minimal() +
+  theme(strip.text = element_text(size = 7)) + # Shrink titles so they fit
+  labs(title = "Detailed Check: Real vs. Dummy (Random 9 Peaks)",
+       subtitle = "Comparing shapes on a log10 scale",
+       x = "Intensity", y = "Count")
+```
+Save off for future use
+```{r}
+saveRDS(dummy_peak_file,
+        file = "../../Ancillary_pid_1000DUMMY_peak_values.RDS")
+
+#system("gsutil cp ../../Ancillary_pid_1000DUMMY_peak_values.RDS gc_bucket_location")
+system("gsutil cp ../../Ancillary_pid_1000DUMMY_peak_values.RDS gs://ancillarydemographics-wb-mighty-apple-994/")
+system("gsutil cp ../../Ancillary_pid_1000DUMMY_peak_values.RDS gs://can-we-see-it-wb-mighty-apple-994")
+
+```
+
+```{r}
+dummy1 <- readRDS(file = "../../Can_we_see_it/Ancillary_pid_1000DUMMY_peak_values.RDS")
+
+list.files("/home/rstudio/workspace/Can_we_see_it/")
+```
+
+process the data
+```{r}
+# 1. Start with the dummy data
+dummy_processed <- dummy1 |>
+  
+  # --- STEP 1: FILTERING (Feature-wise) ---
+  # Remove peaks that are "zero" in more than 20% of samples.
+  # This prevents noise from being treated as signal.
+  group_by(exposure) |>
+  filter(sum(intensity == 0) / n() < 0.20) |>
+  ungroup() |>
+  
+  # --- STEP 2: NORMALIZATION (Sample-wise) ---
+  # Corrects for the fact that some people have "brighter" samples than others.
+  # We divide every peak in a person's profile by that person's median intensity.
+  group_by(pid) |>
+  mutate(intensity = intensity / median(intensity[intensity > 0], na.rm = TRUE)) |>
+  ungroup() |>
+  
+  # --- STEP 3: TRANSFORMATION (Log) ---
+  # Pulls in the "long tail" of high-intensity values.
+  # We use log1p (log(x + 1)) to keep zeros as zeros.
+  mutate(intensity = log1p(intensity)) |>
+  
+  # --- STEP 4: SCALING (Feature-wise / Autoscaling) ---
+  # Subtract the mean and divide by SD for each peak.
+  # This makes every peak have a Mean of 0 and an SD of 1.
+  group_by(exposure) |>
+  mutate(intensity = (intensity - mean(intensity, na.rm = TRUE)) / sd(intensity, na.rm = TRUE)) |>
+  ungroup()
+
+# Quick check: The mean for any peak should now be ~0 and SD ~1
+summary(dummy_processed$intensity)
+```
+
+
+check Sex to see if there are significant peaks
+```{r}
+# Join with sex/year/self_report and run the model
+final_results <- dummy_processed %>%
+  inner_join(sample_table, by = "pid") %>%
+  filter(sex %in% c("Male", "Female")) %>%
+  group_by(exposure) %>%
+  do(tidy(lm(intensity ~ sex + year + self_report, data = .))) %>%
+  filter(term == "sexMale") %>%
+  mutate(p_adj = p.adjust(p.value, method = "BH"))
+
+# Check your top hits (likely empty, which is the goal for dummy data!)
+print(head(final_results))
+
+#p-value histogram
+ggplot(data = final_results,
+       aes(x = p.value)) +
+  geom_histogram(bins = 100)
+
+mean(final_results$p.value < 0.05)
+```
+

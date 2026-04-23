@@ -1,0 +1,905 @@
+---
+title: "20260325_CRC_ancill_demo.Rmd"
+output: html_document
+date: "2026-03-25"
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+
+lapply(c('viridis', 'ggthemes', 'skimr', 'stringr', 'bigrquery'),
+       function(pkg_name) { if(! pkg_name %in% installed.packages()) { install.packages(pkg_name)} } )
+
+library(stringr)
+library(viridis)    # A nice color scheme for plots.
+library(ggthemes)   # Common themes to change the look and feel of plots.
+library(lubridate)  # Date library from the tidyverse.
+library(tidyverse)  # Data wrangling packages.
+library(bigrquery)  # Data extraction from Google BigQuery
+
+library(data.table)
+##library(zipcodeR) ### trying a different way
+
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(tidyr)
+library(stringr)
+
+```
+
+
+```{r data import}
+data_person <- fread("../data/20260325_072814_1268280261_data_person-000000000000.csv.gz")
+
+waist <- fread("../data/20260325_073656_102899057_data_waistCircumference-000000000000.csv.gz")
+hip <- fread("../data/20260325_073656_161696072_data_hipCircumference-000000000000.csv.gz")
+height <- fread("../data/20260325_073656_454031082_data_height-000000000000.csv.gz")
+weight <- fread("../data/20260325_073656_944882696_data_weight-000000000000.csv.gz")
+bp <- fread("../data/20260325_073656_1405775660_data_bloodPressure-000000000000.csv.gz")
+bmi <- fread("../data/20260325_073656_1406089081_data_bmi-000000000000.csv.gz")
+zip <- fread("../data/20260325_073656_2143096321_data_zipcodeSocioeconomic-000000000000.csv.gz")
+
+#genetic data
+anc_pred <- fread("../../vwb-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/ancestry/echo_v4_r2.ancestry_preds.tsv")
+#rels <- fread("../../vwb-aou-datasets-controlled/v8/wgs/short_read/")
+
+```
+
+# Random Sample
+### pull a random sample of people
+### these all have EHR and genomics
+### later we will add in the IDs of the ancillary study here
+```{r random sample}
+anc_N <- 5626
+
+rand_samp <- sample(data_person$person_id, size = anc_N)
+
+anc_IDs <- fread("../data/clean_IDs.txt")
+anc_IDs <- anc_IDs$V1
+
+anc_list <- anc_IDs
+
+```
+
+### get the basics on everyone
+```{r thin data}
+#basic demo
+anc_data_person <- data_person |>
+  dplyr::filter(person_id %in% anc_list) |>
+  dplyr::select(-ethnicity, -gender, -race) |>
+  dplyr::rename(gender = T_DISP_gender,
+                ethnicity = T_DISP_ethnicity,
+                race = T_DISP_race,
+                sex = T_DISP_sex_at_birth,
+                self_report = T_DISP_self_reported_category) |>
+  dplyr::mutate(dob = as.Date(date_of_birth)) |>
+  dplyr::select(person_id,
+                dob,
+                gender,
+                race,
+                sex,
+                ethnicity,
+                self_report)
+```
+
+### get the physical measurements
+```{r thin and merge data}
+# 1. Define your dataframes and the desired suffixes
+# Using a named list makes automation much easier
+raw_data_list <- list(
+  bp = bp, waist = waist, hip = hip, bmi = bmi, 
+  ht = height, wt = weight
+)
+
+# 1. Prep each file: Filter by ID, Normalize Dates, and Add Suffixes + Flags
+prep_list <- purrr::imap(raw_data_list, function(df, name) {
+  df |> 
+    dplyr::filter(person_id %in% anc_list) |> 
+    dplyr::mutate(
+      person_id = as.character(person_id),
+      date = as.Date(date),
+      # Add a hidden flag to prove this person had a record in this file on this date
+      !!paste0("present.", name) := TRUE 
+    ) |> 
+    dplyr::rename_with(~paste0(., ".", name), -c(person_id, date, starts_with("present.")))
+})
+
+# 2. Join into one wide table
+master_joined <- prep_list |> 
+  purrr::reduce(dplyr::full_join, by = c("person_id", "date"))
+
+# 3. Filter and Slice based on "Presence" rather than "Values"
+final_df <- master_joined |>
+  # Count actual non-NA measurements for the "richest data" tie-breaker
+  # (We exclude the presence flags from this count)
+  dplyr::mutate(
+    data_points_count = rowSums(!is.na(dplyr::across(-c(person_id, date, starts_with("present."))))),
+    # Ensure the "present" flags are treated as FALSE if they are NA after the join
+    dplyr::across(starts_with("present."), ~dplyr::coalesce(., FALSE))
+  ) |>
+  # Logic: Keep if the record existed in Cat 2 AND Cat 1, even if values are NA
+  dplyr::filter(
+    (present.ht | present.wt) & 
+    (present.bp | present.waist | present.hip | present.bmi)
+  ) |>
+  # 4. Pick the row with the most actual data
+  dplyr::group_by(person_id) |>
+  dplyr::slice_max(data_points_count, n = 1, with_ties = FALSE) |>
+  dplyr::ungroup()
+
+# How many of your 6k actually had matching dates?
+length(unique(final_df$person_id))
+
+# See which columns are the most complete
+colSums(!is.na(final_df))
+
+final_df |>
+  dplyr::select(
+    BP     = systolic.bp,
+    Waist  = value_numeric.waist,
+    Hip    = value_numeric.hip,
+    BMI    = value_numeric.bmi,
+    Height = value_numeric.ht,
+    Weight = value_numeric.wt
+  ) |>
+  # Create a logical table (TRUE if data exists) and sum the TRUES
+  is.na() |>
+  (\(x) !x)() |> 
+  colSums()
+```
+
+# Who is missing?
+```{r}
+# Find who is still missing from the final result
+still_missing <- setdiff(anc_list, final_df$person_id)
+
+# Check their presence flags in the master join
+master_joined |> 
+  filter(person_id %in% still_missing) |> 
+  select(person_id, date, starts_with("present."))
+
+
+missing_anc <- anc_list[!anc_list %in% final_df$person_id]
+
+pick <- 174
+#pick <- 224
+
+missing_anc[pick]
+
+data_person |> dplyr::filter(person_id == missing_anc[pick])
+weight |> dplyr::filter(person_id == missing_anc[pick])
+height |> dplyr::filter(person_id == missing_anc[pick])
+hip |> dplyr::filter(person_id == missing_anc[pick])
+bmi |> dplyr::filter(person_id == missing_anc[pick])
+bp |> dplyr::filter(person_id == missing_anc[pick])
+
+```
+
+#final merge
+```{r}
+final_df_merge <- final_df |>
+  dplyr::mutate(person_id = as.integer(person_id)) |>
+  dplyr::left_join(zip, by = "person_id")
+
+anc_data <- anc_data_person |>
+  dplyr::left_join(final_df_merge, by = "person_id")
+```
+
+
+# Geographic location (Zip3) with State and Census Region
+```{r}
+# Your raw data
+my_data <- data.frame(zip_raw = c("277**", "902**", "606**", "021**"))
+
+# Remove asterisks to get a clean 3-digit string
+my_data <- my_data %>%
+  mutate(zip3 = str_remove_all(zip_raw, fixed("*")))
+
+## a simple mapping function
+get_region <- function(z) {
+  z <- as.numeric(z)
+  case_when(
+    z >= 010 & z <= 089 ~ "NE", # CT, MA, ME, NH, RI, VT, NJ
+    z >= 100 & z <= 199 ~ "NE", # NY, PA, DE
+    z >= 200 & z <= 299 ~ "S",  # DC, MD, VA, WV, NC, SC
+    z >= 300 & z <= 399 ~ "S",  # GA, FL, AL, MS, TN
+    z >= 400 & z <= 499 ~ "MW", # KY, OH, IN, MI
+    z >= 500 & z <= 599 ~ "MW", # IA, WI, MN, SD, ND, MT
+    z >= 600 & z <= 699 ~ "MW", # IL, MO, KS, NE
+    z >= 700 & z <= 799 ~ "S",  # LA, AR, OK, TX
+    z >= 800 & z <= 899 ~ "W",  # CO, WY, ID, UT, AZ, NM, NV
+    z >= 900 & z <= 999 ~ "W",  # CA, HI, OR, WA, AK
+    TRUE ~ "Unknown"
+  )
+}
+
+my_data <- my_data %>%
+  mutate(region = get_region(zip3))
+
+print(my_data)
+```
+
+# Get Region and State for Anc List
+```{r}
+anc_data <- anc_data |>
+    dplyr::rename(zip_raw = zip_code) |>
+    dplyr::mutate(zip3 = str_remove_all(zip_raw, fixed("*"))) |> 
+    dplyr::mutate(region = get_region(zip3))
+```
+
+
+# Some Stats
+```{r}
+# Standard fix for the sex column
+anc_data |>
+  dplyr::mutate(sex = dplyr::case_match(sex,
+    "Male"   ~ "M",
+    "Female" ~ "F",
+    .default = "Other"
+  )) |>
+  # To get a summary, you usually want to group by the category first
+  dplyr::group_by(sex) |> 
+  dplyr::summarise(count = dplyr::n(),
+                   percent = 100 * dplyr::n()/nrow(anc_data))
+
+anc_data |>
+  dplyr::mutate(self_report = dplyr::case_match(self_report,
+    "American Indian or Alaska Native"   ~ "American Indian or Alaska Native",
+    "Asian"   ~ "Asian",
+    "Black or African American"   ~ "Black or African American",
+    "Hispanic"   ~ "Hispanic",
+    "More than one population"   ~ "More than one population",
+    "White"   ~ "White",
+    .default = "Other"
+  )) |>
+  # To get a summary, you usually want to group by the category first
+  dplyr::group_by(self_report) |> 
+  dplyr::summarise(count = dplyr::n(),
+                   percent = 100 * dplyr::n()/nrow(anc_data)) |>
+  dplyr::arrange(desc(percent))
+
+# 1. Create the Summary Table
+sex_summary <- anc_data |>
+  dplyr::mutate(sex = dplyr::case_match(sex,
+    "Male"   ~ "M",
+    "Female" ~ "F",
+    .default = "Other"
+  )) |>
+  filter(!is.na(sex), !is.na(region)) |> # Remove any NAs for a cleaner view
+  group_by(region, sex) |>
+  summarise(count = n(), .groups = 'drop') |>
+  group_by(region) |>
+  mutate(percentage = (count / sum(count)) * 100)
+
+print(sex_summary)
+
+# 2. Visualize the Breakdown
+# A stacked bar chart showing the percentage of T2D status per region
+ggplot(sex_summary, aes(x = region, y = percentage, fill = as.factor(sex))) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_brewer(palette = "Set2", name = "Sex") +
+  labs(
+    title = "Breakdown of Sex by Census Region",
+    x = "Census Region",
+    y = "Percentage (%)",
+    caption = "Data categorized by Zip3 mapping"
+  ) +
+  theme_minimal()
+```
+
+# Region Breakdown
+```{r}
+
+# --- STEP 3: Breakdown of Demographics by Region ---
+
+# A. Age Distribution by Region
+# (Assuming 'age' is a numeric column)
+age_plot <- ggplot(anc_data, aes(x = region, y = age, fill = region)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Age Distribution by Census Region (Non-T2D)", y = "Age") +
+  theme_minimal()
+
+# B. Sex at Birth Breakdown
+sex_breakdown <- anc_data %>%
+  count(region, sex) %>%
+  group_by(region) %>%
+  mutate(pct = n / sum(n) * 100)
+
+# C. Race Breakdown
+race_breakdown <- anc_data %>%
+  count(region, race) %>%
+  group_by(region) %>%
+  mutate(pct = n / sum(n) * 100)
+
+# Print the tables
+print("Sex at Birth by Region:")
+print(sex_breakdown)
+
+print("Race by Region:")
+print(race_breakdown)
+
+# Visualizing Race by Region
+ggplot(race_breakdown, aes(x = region, y = pct, fill = race)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Race Breakdown by Census Region", y = "Percentage of Regional Sample") +
+  theme_minimal()
+
+# Create a combined Violin + Boxplot
+ggplot(anc_data, aes(x = region, y = age_at_occurrence.bp, fill = region)) +
+  geom_violin(alpha = 0.3) +
+  geom_boxplot(width = 0.2, color = "black", outlier.shape = NA) +
+  # Adding a jitter to see the actual data points (useful if sample size is small)
+  geom_jitter(width = 0.1, alpha = 0.1, size = 0.5) +
+  scale_fill_brewer(palette = "Pastel1") +
+  labs(
+    title = "Age Distribution by Census Region",
+    subtitle = "Non-T2D Patients Only",
+    x = "Region",
+    y = "Age (Years)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Statistical test for age differences across regions
+age_anova <- aov(age_at_occurrence.bp ~ region, data = anc_data)
+summary(age_anova)
+
+# If the p-value is < 0.05, you can see which specific regions differ:
+# TukeyHSD(age_anova)
+
+# 1. Chi-square for Sex at Birth vs. Region
+sex_table <- table(anc_data$region, anc_data$sex)
+sex_chisq <- chisq.test(sex_table)
+
+print("Chi-square Test: Sex at Birth by Region")
+print(sex_chisq)
+
+# 2. Chi-square for Race vs. Region
+race_table <- table(anc_data$region, anc_data$race)
+race_chisq <- chisq.test(race_table)
+
+print("Chi-square Test: Race by Region")
+print(race_chisq)
+```
+
+
+
+
+# PCA Data from entire AoU
+```{r}
+table(anc_pred$ancestry_pred)
+
+anc_pred_clean <- anc_pred |>
+  dplyr::mutate(
+    # 1. Remove the brackets [ ] so we just have "0.101, 0.138, ..."
+    probabilities = str_remove_all(probabilities, "\\[|\\]")
+  ) |>
+  # 2. Split into multiple columns
+  # names_sep = "_" will name them column_to_split_1, column_to_split_2, etc.
+  separate_wider_delim(
+    cols = probabilities,
+    delim = ", ",
+    names_sep = "_",
+    too_few = "align_start"
+  ) |>
+  # 3. Convert all those new columns from character to numeric
+  dplyr::mutate(across(starts_with("probabilities_"), as.numeric)) |>
+  dplyr::rename(afr = probabilities_1,
+         amr = probabilities_2,
+         eas = probabilities_3,
+         eur = probabilities_4,
+         mid = probabilities_5,
+         sas = probabilities_6) |>
+  dplyr::rename(pca = pca_features) |>
+  dplyr::mutate(
+    # 1. Remove the brackets [ ] so we just have "0.101, 0.138, ..."
+    pca = str_remove_all(pca, "\\[|\\]")
+  ) |>
+  separate_wider_delim(
+    cols = pca,
+    delim = ", ",
+    names_sep = "_",
+    too_few = "align_start"
+  ) |>
+  dplyr::mutate(across(starts_with("pca_"), as.numeric))
+
+ancestry_anc <- anc_pred_clean |>
+  dplyr::rename(person_id = research_id) |>
+  dplyr::filter(person_id %in% anc_list)
+
+### ggplot some 
+ggplot(data = ancestry_anc,
+       aes(x = pca_1,
+           y = pca_2,
+           col = ancestry_pred)) +
+  geom_point() +
+  theme_minimal()
+
+
+ancestry_anc |>
+  dplyr::left_join(anc_data, by = "person_id") |>
+  dplyr::select(ancestry_pred, self_report) |>
+  dplyr::group_by(ancestry_pred, self_report) |>
+  dplyr::summarize(n = n()) 
+
+ancestry_anc |>
+  left_join(anc_data, by = "person_id") |>
+  select(ancestry_pred, self_report) |>
+  group_by(ancestry_pred, self_report) |>
+  summarize(n = n(), .groups = "drop") |>
+  pivot_wider(names_from = self_report,
+              values_from = n,
+              values_fill = 0)
+
+ggplot(data = ancestry_anc |>
+  left_join(anc_data, by = "person_id"),
+       aes(x = pca_1,
+           y = pca_2,
+           col = self_report)) +
+  geom_point() +
+  theme_minimal()
+```
+
+
+
+
+
+# Get Genotype data from AoU
+
+```{r}
+
+# dim(rels)
+# summary(rels$kin)
+# rel_list
+# 
+# sum(anc_list %in% rel_list)
+# sum(anc_list %in% rels$i.s)
+# sum(anc_list %in% rels$j.s)
+# 
+# rels |>
+#   dplyr::filter(i.s %in% rel_list$sample_id)
+# 
+# rels |>
+#   dplyr::filter(j.s %in% rel_list$sample_id)
+
+
+```
+
+# Subset the PLINK calls
+```{r}
+
+## this is where we can check for X/Y and confirm sex
+#bim <- fread("../../vwb-aou-datasets-controlled/v8/microarray/plink/arrays.bim")
+#bed <- fread("../../vwb-aou-datasets-controlled/v8/microarray/plink/arrays.bed")
+fam <- fread("../../vwb-aou-datasets-controlled/v8/microarray/plink/arrays.fam")
+
+#head(bim)
+head(fam)
+
+# IDs you want to keep: one IID per line in ids_to_keep.txt
+ids <- anc_list
+
+# Read the PLINK fam file
+#fam <- read.table("large_cohort.fam", header = FALSE)
+colnames(fam)[1:2] <- c("FID", "IID")
+
+# Match requested IDs to the source file
+keep <- fam[fam$IID %in% ids, c("FID", "IID")]
+
+# Check for missing IDs
+missing_ids <- setdiff(ids, fam$IID)
+length(missing_ids)
+head(missing_ids)
+
+# Write PLINK keep file
+write.table(
+  keep,
+  file = "../data/plink/anc_list.txt",
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE,
+  sep = "\t"
+)
+
+```
+
+# check the sex with plink
+# run these commands in terminal mode
+
+# 0) get to where you're going and make a local output directory on the VM
+cd /home/rstudio/workspace/AncillaryDemographics/rmd
+mkdir -p /tmp/plink_out
+
+# 1) subset chrX to your keep-list into /tmp (about 5-10 mins)
+# chrX: subset + split PAR + write to /tmp
+plink2 \
+  --threads 8 \
+  --memory 60000 \
+  --pfile ../../vwb-aou-datasets-controlled/v8/wgs/short_read/snpindel/acaf_threshold/pgen/acaf_threshold.chrX \
+  --keep ../data/plink/anc_list.txt \
+  --split-par hg38 \
+  --make-pgen \
+  --out /tmp/plink_out/anc_list_chrX
+
+# 3) run chrX sex check
+# this produces .sexcheck with IID, PEDSEX, SNPSEX, STATUS, F
+plink2 \
+  --threads 8 \
+  --memory 60000 \
+  --pfile /tmp/plink_out/anc_list_chrX \
+  --check-sex max-female-xf=0.2 min-male-xf=0.8 \
+  --out /tmp/plink_out/anc_list_chrX_sexcheck
+
+# 4) subset chrY to your keep-list into /tmp
+# chrX: subset + split PAR + write to /tmp
+plink2 \
+  --threads 8 \
+  --memory 60000 \
+  --pfile ../../vwb-aou-datasets-controlled/v8/wgs/short_read/snpindel/acaf_threshold/pgen/acaf_threshold.chrY \
+  --keep ../data/plink/anc_list.txt \
+  --make-pgen \
+  --out /tmp/plink_out/anc_list_chrY
+
+
+# 5) run chrY sample missingness
+# this produces .smiss with IID, MISSING_CT, OBS_CT, F_MISS
+plink2 \
+  --threads 8 \
+  --memory 60000 \
+  --pfile /tmp/plink_out/anc_list_chrY \
+  --missing sample-only \
+  --y-nosex-missing-stats \
+  --out /tmp/plink_out/anc_list_chrY_missing
+
+# 6) inspect the two headers
+head -n 5 /tmp/plink_out/anc_list_chrX_sexcheck.sexcheck
+head -n 5 /tmp/plink_out/anc_list_chrY_missing.smiss
+
+# 7) join the two files by IID into one tab-delimited table
+awk 'BEGIN{FS=OFS="\t"}
+FNR==1 && NR==1 {next}
+FNR==1 {next}
+NR==FNR {x[$1]=$2 OFS $3 OFS $4 OFS $5; next}
+($1 in x) {print $1, x[$1], $2, $3, $4}
+' /tmp/plink_out/anc_list_chrX_sexcheck.sexcheck /tmp/plink_out/anc_list_chrY_missing.smiss \
+| awk 'BEGIN{FS=OFS="\t"; print "IID","PEDSEX","SNPSEX","STATUS","X_F","Y_MISSING_CT","Y_OBS_CT","Y_F_MISS"} {print}' \
+> /tmp/plink_out/anc_list_chrXY_joined.tsv
+
+
+# 7) preview the merged result
+head -n 20 /tmp/plink_out/anc_list_chrXY_joined.tsv
+
+cp /tmp/plink_out/anc_list_chrXY_joined.tsv ../data/plink/
+
+
+```{r}
+plink_sex <- fread("../data/plink/anc_list_chrXY_joined.tsv")
+
+plink_sex <- plink_sex |>
+  dplyr::rename(person_id = IID) |>
+  dplyr::mutate(sex_pred_plink = ifelse(X_F > .85 & Y_F_MISS < .825, "M", "F"))
+
+```
+
+
+```{r}
+plink_sex |>
+  dplyr::filter(X_F > .8 & Y_F_MISS < .25)
+
+plink_sex |>
+  dplyr::filter(X_F < .5 & Y_F_MISS > .75)
+
+ggplot(data = plink_sex,
+       aes(x = X_F,
+           y = Y_F_MISS)) +
+  geom_point()
+
+
+ggplot(data = plink_sex |>
+        dplyr::left_join(anc_data, by = "person_id"),
+       aes(x = X_F,
+           y = Y_F_MISS,
+           col = sex)) +
+  geom_point()
+
+ggplot(data = plink_sex |>
+        dplyr::left_join(anc_data, by = "person_id"),
+       aes(x = X_F,
+           y = Y_F_MISS,
+           col = gender)) +
+  geom_hline(yintercept = .825) +
+  geom_vline(xintercept = .85) +
+  geom_point()
+
+#high y missingness
+plink_sex |>
+  dplyr::left_join(anc_data, by = "person_id") |>
+  dplyr::filter(X_F > .8 & Y_F_MISS > .25) |>
+  dplyr::select(gender, sex) |>
+  dplyr::mutate(g_s = paste0(gender,"-",sex)) 
+```
+
+# finally, combine ancestry, and plink sex info with anc_data
+```{r}
+ancillary_meta_data <- anc_data |>
+  dplyr::left_join(ancestry_anc, by = "person_id") |>
+  dplyr::left_join(plink_sex, by = "person_id")
+
+saveRDS(ancillary_meta_data,
+        file = "../data/ancillary_meta_data.RDS")
+
+```
+
+
+# bring in survey results (mostly for SDOH)
+```{r}
+survey_Occ0 <- fread("../data/20260325_073656_1885991969_data_surveyOccurrence-000000000000.csv.gz") |>
+  dplyr::filter(person_id %in% anc_list)
+survey_Occ1 <- fread("../data/20260325_073656_1885991969_data_surveyOccurrence-000000000001.csv.gz") |>
+  dplyr::filter(person_id %in% anc_list)
+
+files <- list.files(
+  path = "../data",
+  pattern = "surveyOccurrence-.*\\.csv\\.gz$",
+  full.names = TRUE
+)
+
+survey_occ <- rbindlist(lapply(files, function(f) {
+  dt <- fread(f)
+  dt[person_id %in% anc_list][, source_file := basename(f)]
+}))
+
+saveRDS(survey_occ,
+        file = "../data/ancillary_survey_data.RDS")
+
+unique(survey_occ$T_DISP_question)
+
+survey_occ |> 
+  dplyr::filter(T_DISP_question == "Have you ever used an electronic nicotine product, even one or two times? (Electronic nicotine products include e-cigarettes, vape pens, hookah pens, personal vaporizers and mods, e-cigars, e-pipes, and e-hookahs.)") |>
+  dplyr::group_by(T_DISP_answer) |>
+  dplyr::summarise(n = n())
+
+survey_occ |> 
+  dplyr::filter(T_DISP_question == "Have you smoked at least 100 cigarettes in your entire life? (There are 20 cigarettes in a pack.)" ) |>
+  dplyr::group_by(T_DISP_answer) |>
+  dplyr::summarise(n = n())
+
+survey_occ |> 
+  dplyr::filter(T_DISP_question == "Do you now use electronic nicotine products…") |>
+  dplyr::group_by(T_DISP_answer) |>
+  dplyr::summarise(n = n())
+
+
+survey_occ |> 
+  dplyr::filter(T_DISP_question == "Do you now smoke cigarettes every day, some days, or not at all?") |>
+  dplyr::group_by(T_DISP_answer) |>
+  dplyr::summarise(n = n())
+
+
+## cross reference smoking and e-cigs
+# 1. Filter for just the two questions you want
+# 2. Pivot so each person has one row with two columns
+# 3. Pipe directly into the table function
+cross_tab <- survey_occ |>
+  filter(T_DISP_question %in% c(
+    "Do you now use electronic nicotine products…",
+    "Do you now smoke cigarettes every day, some days, or not at all?"
+  )) |>
+  pivot_wider(
+    id_cols = person_id, # <--- Replace 'ID' with your actual respondent ID column name
+    names_from = T_DISP_question, 
+    values_from = T_DISP_answer
+  ) |>
+  select(-person_id) |> # Remove the ID so it doesn't clutter the table
+  table()
+
+# View the result
+cross_tab
+
+# 1. Filter and Recode
+survey_clean <- survey_occ |>
+  filter(T_DISP_question %in% c(
+    "Do you now use electronic nicotine products…",
+    "Do you now smoke cigarettes every day, some days, or not at all?"
+  )) |>
+  mutate(T_DISP_answer = case_match(
+    T_DISP_answer,
+    c("Dont Know", "Prefer Not To Answer", "Skip") ~ "Skip",
+    c("Every Day", "Some Days")                   ~ "Some",
+    "Not At All"                                  ~ "None",
+    .default = T_DISP_answer  # Keeps other answers as-is if they don't match
+  ))
+
+# 2. Pivot and Table
+cross_tab <- survey_clean |>
+  pivot_wider(
+    id_cols = person_id,  # <--- Change 'ID' to your actual respondent ID column
+    names_from = T_DISP_question, 
+    values_from = T_DISP_answer
+  ) |>
+  select(-person_id) |>
+  table()
+
+# 3. View the matrix
+cross_tab
+
+
+
+survey_occ |>
+  dplyr::filter(T_DISP_question == "What is your annual household income from all sources?") |>
+  dplyr::group_by(T_DISP_answer) |>
+  dplyr::summarise(n = n()) |>
+  dplyr::arrange(desc(n))
+
+survey_occ |>
+  dplyr::filter(T_DISP_question == "What is the highest grade or year of school you completed?") |>
+  dplyr::group_by(T_DISP_answer) |>
+  dplyr::summarise(n = n()) |>
+  dplyr::arrange(desc(n))
+
+```
+
+
+```{r}
+survey_income <- survey_occ |>
+  dplyr::filter(T_DISP_question == "What is your annual household income from all sources?") |>
+  dplyr::rename(annual_household_income = T_DISP_answer) |>
+  dplyr::select(person_id, annual_household_income)
+
+survey_edu <- survey_occ |>
+  dplyr::filter(T_DISP_question == "What is the highest grade or year of school you completed?") |>
+  dplyr::rename(highest_edu = T_DISP_answer) |>
+  dplyr::select(person_id, highest_edu)
+
+survey_sdoh <- survey_income |>
+  dplyr::left_join(survey_edu, by = "person_id")
+
+head(survey_sdoh)
+
+ancillary_meta_data <- ancillary_meta_data |>
+  dplyr::left_join(survey_sdoh, by = "person_id")
+
+saveRDS(ancillary_meta_data,
+        file = "../data/ancillary_meta_data.RDS")
+
+```
+
+```{r}
+
+table(survey_sdoh$annual_household_income)
+
+table(survey_sdoh$highest_edu)
+
+midpoint_map <- c(
+  "less 10k" = 5,
+  "10k 25k" = 17.5,
+  "25k 35k" = 30,
+  "35k 50k" = 42.5,
+  "50k 75k" = 62.5,
+  "75k 100k" = 87.5,
+  "100k 150k" = 125,
+  "150k 200k" = 175,
+  "more 200k" = 225
+)
+
+education_years_map <- c(
+  "Never Attended" = 0,
+  "One Through Four" = 2.5,
+  "Five Through Eight" = 6.5,
+  "Nine Through Eleven" = 10,
+  "Twelve Or GED" = 12,
+  "College One to Three" = 14,
+  "College Graduate" = 16,
+  "Advanced Degree" = 18
+)
+
+just_sex <- ancillary_meta_data |>
+  dplyr::select(person_id, sex_pred_plink)
+
+sdoh <- survey_sdoh |>
+  dplyr::mutate(income_num = recode(annual_household_income,
+                                    !!!midpoint_map,
+                                    .default = NA_real_)) |>
+  dplyr::mutate(education_years = recode(highest_edu,
+                                         !!!education_years_map,
+                                         .default = NA_real_)) |>
+  dplyr::left_join(just_sex, by = "person_id")
+
+ggplot(data = sdoh |> dplyr::filter(!is.na(income_num)) |> dplyr::filter(!is.na(education_years)),
+       aes(x = education_years,
+           y = income_num,
+           col = sex_pred_plink)) +
+  geom_jitter(alpha = .05,
+              height = 5,
+              width = .2) +
+  geom_smooth(method = "loess", se = FALSE) +
+  theme_minimal()
+
+```
+
+
+# Sandbox Exploration
+### multiple weights/heights?
+
+```{r}
+weight |> 
+  dplyr::filter(person_id %in% anc_list) |> 
+  dplyr::add_count(person_id) |> 
+  dplyr::filter(n > 1) |>
+  dplyr::arrange(person_id)
+
+# 1. Prepare the data
+plot_data <- weight |>
+  dplyr::mutate(date = as.Date(date)) |>
+  dplyr::filter(person_id %in% anc_list) |>
+  dplyr::group_by(person_id) |>
+  dplyr::arrange(date, .by_group = TRUE) |>
+  dplyr::mutate(
+    # Calculate difference from the previous weight
+    time_between = as.numeric(date - dplyr::lag(date), units = "days"),
+    weight_diff = value_numeric - dplyr::lag(value_numeric)
+  ) |>
+  # Remove the first row for each person (it will have NA for differences)
+  dplyr::filter(!is.na(time_between)) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(weight_change = ifelse(weight_diff > 0, "gain",
+                                       ifelse(weight_diff < 0, "loss", "none")))
+
+# 2. Create the plot
+ggplot(plot_data, aes(x = time_between,
+                      y = abs(weight_diff),
+                      col = weight_change)) +
+  geom_point(alpha = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") + # Baseline for no change
+  geom_smooth(method = "lm",
+              formula = "y~x",
+              color = "black", se = FALSE) + 
+  labs(
+    title = "Weight Change vs. Time Interval",
+    x = "Days Between Measurements",
+    y = "Change in Weight (kg)"
+  ) +
+  theme_minimal()
+
+
+### same for height
+height |> 
+  dplyr::filter(person_id %in% anc_list) |> 
+  dplyr::add_count(person_id) |> 
+  dplyr::filter(n > 1) |>
+  dplyr::arrange(person_id)
+
+# 1. Prepare the data
+plot_data <- height |>
+  dplyr::mutate(date = as.Date(date)) |>
+  dplyr::filter(person_id %in% anc_list) |>
+  dplyr::group_by(person_id) |>
+  dplyr::arrange(date, .by_group = TRUE) |>
+  dplyr::mutate(
+    # Calculate difference from the previous weight
+    time_between = as.numeric(date - dplyr::lag(date), units = "days"),
+    height_diff = value_numeric - dplyr::lag(value_numeric)
+  ) |>
+  # Remove the first row for each person (it will have NA for differences)
+  dplyr::filter(!is.na(time_between)) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(height_change = ifelse(height_diff > 0, "gain",
+                                       ifelse(height_diff < 0, "loss", "none")))
+
+# 2. Create the plot
+ggplot(plot_data, aes(x = time_between,
+                      y = abs(height_diff),
+                      col = height_change)) +
+  geom_point(alpha = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") + # Baseline for no change
+  geom_smooth(method = "lm",
+              formula = "y~x",
+              color = "black", se = FALSE) + 
+  labs(
+    title = "Height Change vs. Time Interval",
+    x = "Days Between Measurements",
+    y = "Change in Height (cm)"
+  ) +
+  theme_minimal()
+```

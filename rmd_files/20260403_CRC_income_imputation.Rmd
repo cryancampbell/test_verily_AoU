@@ -1,0 +1,606 @@
+---
+title: "20260403_CRC_income_imputation"
+output: html_document
+date: "2026-04-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+knitr::opts_chunk$set(echo = TRUE)
+
+lapply(c('viridis', 'ggthemes', 'skimr', 'stringr', 'bigrquery', 'xgboost'),
+       function(pkg_name) { if(! pkg_name %in% installed.packages()) { install.packages(pkg_name)} } )
+
+library(tidyverse)  # Data wrangling packages.
+library(bigrquery)  # Data extraction from Google BigQuery
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(xgboost)
+
+
+```
+
+
+```{r data import}
+data_person <- fread("../data/20260325_072814_1268280261_data_person-000000000000.csv.gz")
+
+anc_IDs <- fread("../data/clean_IDs.txt")
+anc_IDs <- anc_IDs$V1
+anc_list <- anc_IDs
+
+data_person_anc <- data_person |>
+  dplyr::filter(person_id %in% anc_list)
+
+data_person_aou <- data_person |>
+  dplyr::filter(!person_id %in% anc_list)
+
+```
+
+
+```{r}
+survey_Occ0 <- fread("../data/20260325_073656_1885991969_data_surveyOccurrence-000000000000.csv.gz") |>
+  dplyr::filter(person_id %in% anc_list)
+
+files <- list.files(
+  path = "../data",
+  pattern = "surveyOccurrence-.*\\.csv\\.gz$",
+  full.names = TRUE
+)
+
+# survey_anc <- rbindlist(lapply(files, function(f) {
+#   dt <- fread(f)
+#   dt[person_id %in% data_person_anc$person_id][, source_file := basename(f)]
+# }))
+
+survey_aou <- rbindlist(lapply(files, function(f) {
+  dt <- fread(f)
+  dt[person_id %in% data_person_aou$person_id][, source_file := basename(f)]
+}))
+
+#drop SDOH
+survey_aou <- survey_aou |>
+  dplyr::filter(T_DISP_survey_version %in% c("Lifestyle",
+                                             "Overall Health",
+                                             "The Basics"))
+
+```
+
+
+he cleanest XGBoost setup here is multiclass classification on the income bracket labels, not numeric regression on bracket midpoints. XGBoost tree models also handle missing predictor values by default, so your 5% missing education field can stay in the feature set.
+
+I would not call plain XGBoost the universally “best” solution, though. For predictive fill-in, it is a strong baseline. For downstream survey inference, I would benchmark it against a proper multiple-imputation workflow. mice explicitly supports ordered categorical variables and uses polr by default for ordered factors with more than two levels. More broadly, model-based imputation relies on assumptions about the missingness mechanism: under MAR you condition on observed variables, but if income nonresponse is still driven by the unobserved income itself after conditioning on observables, that is MNAR and deserves sensitivity analysis rather than blind trust in one model.
+
+
+Some Imputation Code
+```{r}
+
+
+# Keep this in the exact questionnaire order.
+# If your real instrument has a "150k 200k" bucket, add it here in order.
+income_levels <- c(
+  "less 10k", "10k 25k", "25k 35k", "35k 50k",
+  "50k 75k", "75k 100k", "100k 150k", "150k 200k", "more 200k"
+)
+
+coerce_xgb_types <- function(df) {
+  out <- df
+  for (nm in names(out)) {
+    x <- out[[nm]]
+    if (is.character(x)) {
+      out[[nm]] <- factor(x)
+    } else if (is.logical(x)) {
+      out[[nm]] <- as.integer(x)
+    } else if (inherits(x, "Date") || inherits(x, "POSIXt")) {
+      out[[nm]] <- as.numeric(x)
+    }
+  }
+  out
+}
+
+drop_constant_or_all_missing <- function(df, max_missing = 0.995) {
+  keep <- vapply(df, function(x) {
+    miss <- mean(is.na(x))
+    nunq <- length(unique(x[!is.na(x)]))
+    !(miss >= max_missing || nunq <= 1L)
+  }, logical(1))
+  df[, keep, drop = FALSE]
+}
+
+align_to_template <- function(new_df, template_df) {
+  out <- new_df
+
+  missing_cols <- setdiff(names(template_df), names(out))
+  for (nm in missing_cols) out[[nm]] <- NA
+
+  out <- out[, names(template_df), drop = FALSE]
+
+  for (nm in names(template_df)) {
+    if (is.factor(template_df[[nm]])) {
+      out[[nm]] <- factor(
+        out[[nm]],
+        levels = levels(template_df[[nm]]),
+        ordered = is.ordered(template_df[[nm]])
+      )
+    } else {
+      out[[nm]] <- suppressWarnings(as.numeric(out[[nm]]))
+    }
+  }
+
+  out
+}
+
+stratified_split <- function(y, p_train = 0.70, p_valid = 0.15, seed = 42) {
+  stopifnot(p_train > 0, p_valid > 0, (p_train + p_valid) < 1)
+  set.seed(seed)
+
+  train <- valid <- test <- integer()
+  idx_by_class <- split(seq_along(y), y, drop = TRUE)
+
+  for (idx in idx_by_class) {
+    idx <- sample(idx)
+    n <- length(idx)
+
+    n_train <- floor(p_train * n)
+    n_valid <- floor(p_valid * n)
+
+    if (n >= 3L) {
+      n_train <- max(1L, n_train)
+      n_valid <- max(1L, n_valid)
+    } else if (n == 2L) {
+      n_train <- 1L
+      n_valid <- 0L
+    } else {
+      n_train <- 1L
+      n_valid <- 0L
+    }
+
+    n_test <- n - n_train - n_valid
+    if (n >= 3L && n_test < 1L) {
+      n_test <- 1L
+      if (n_train >= n_valid + 1L) {
+        n_train <- n_train - 1L
+      } else {
+        n_valid <- max(0L, n_valid - 1L)
+      }
+    }
+
+    train <- c(train, idx[seq_len(n_train)])
+
+    if (n_valid > 0L) {
+      valid <- c(valid, idx[seq.int(n_train + 1L, n_train + n_valid)])
+    }
+
+    start_test <- n_train + n_valid + 1L
+    if (start_test <= n) {
+      test <- c(test, idx[start_test:n])
+    }
+  }
+
+  list(train = sort(train), valid = sort(valid), test = sort(test))
+}
+
+as_prob_matrix <- function(pred, nclass) {
+  if (is.matrix(pred)) return(pred)
+  matrix(pred, ncol = nclass, byrow = TRUE)
+}
+
+multiclass_logloss <- function(prob, y_true_zero_based, eps = 1e-15) {
+  p <- pmax(pmin(prob, 1 - eps), eps)
+  idx <- cbind(seq_along(y_true_zero_based), y_true_zero_based + 1L)
+  -mean(log(p[idx]))
+}
+
+fit_income_bracket_imputer <- function(
+  pool_df,
+  income_col,
+  income_levels,
+  exclude_cols = character(),
+  top_k = 80,
+  seed = 42,
+  params = list(
+    objective = "multi:softprob",
+    eval_metric = "mlogloss",
+    max_depth = 6,
+    eta = 0.05,
+    min_child_weight = 5,
+    subsample = 0.8,
+    colsample_bytree = 0.8,
+    tree_method = "hist"
+  )
+) {
+  dat <- coerce_xgb_types(pool_df)
+  dat[[income_col]] <- factor(dat[[income_col]], levels = income_levels, ordered = TRUE)
+
+  observed <- !is.na(dat[[income_col]])
+  if (sum(observed) < 1000L) {
+    stop("Too few observed income rows to do a reliable train/valid/test workflow.")
+  }
+
+  x_all <- dat[, setdiff(names(dat), c(income_col, exclude_cols)), drop = FALSE]
+  x_all <- drop_constant_or_all_missing(x_all)
+
+  x_obs <- x_all[observed, , drop = FALSE]
+  y_obs <- dat[[income_col]][observed]
+
+  split_idx <- stratified_split(y_obs, seed = seed)
+
+  x_train <- x_obs[split_idx$train, , drop = FALSE]
+  x_valid <- align_to_template(x_obs[split_idx$valid, , drop = FALSE], x_train)
+  x_test  <- align_to_template(x_obs[split_idx$test,  , drop = FALSE], x_train)
+
+  y_train <- y_obs[split_idx$train]
+  y_valid <- y_obs[split_idx$valid]
+  y_test  <- y_obs[split_idx$test]
+
+  dtrain <- xgb.DMatrix(x_train, label = as.integer(y_train) - 1L)
+  dvalid <- xgb.DMatrix(x_valid, label = as.integer(y_valid) - 1L)
+
+  params$num_class <- length(income_levels)
+
+  # Pass 1: all features -> gain-based feature selection
+  full_model <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 2000,
+    watchlist = list(train = dtrain, valid = dvalid),
+    early_stopping_rounds = 50,
+    verbose = 1
+  )
+
+  imp <- as.data.frame(xgb.importance(model = full_model))
+  imp <- imp[order(imp$Gain, decreasing = TRUE), , drop = FALSE]
+
+  selected_features <- head(imp$Features, top_k)
+  if (length(selected_features) == 0L) {
+    selected_features <- colnames(x_train)
+  }
+
+  x_train_sel <- x_train[, selected_features, drop = FALSE]
+  x_valid_sel <- x_valid[, selected_features, drop = FALSE]
+  x_test_sel  <- x_test[,  selected_features, drop = FALSE]
+
+  dtrain_sel <- xgb.DMatrix(x_train_sel, label = as.integer(y_train) - 1L)
+  dvalid_sel <- xgb.DMatrix(x_valid_sel, label = as.integer(y_valid) - 1L)
+  dtest_sel  <- xgb.DMatrix(x_test_sel,  label = as.integer(y_test)  - 1L)
+
+  # Pass 2: refit on selected features only
+  selected_model <- xgb.train(
+    params = params,
+    data = dtrain_sel,
+    nrounds = 2000,
+    watchlist = list(train = dtrain_sel, valid = dvalid_sel),
+    early_stopping_rounds = 50,
+    verbose = 1
+  )
+
+  prob_test <- as_prob_matrix(
+    predict(selected_model, dtest_sel),
+    nclass = length(income_levels)
+  )
+
+  pred_test <- factor(
+    income_levels[max.col(prob_test, ties.method = "first")],
+    levels = income_levels,
+    ordered = TRUE
+  )
+
+  metrics <- list(
+    mlogloss = multiclass_logloss(prob_test, as.integer(y_test) - 1L),
+    accuracy = mean(pred_test == y_test),
+    adjacent_accuracy = mean(abs(as.integer(pred_test) - as.integer(y_test)) <= 1L),
+    mean_abs_bucket_error = mean(abs(as.integer(pred_test) - as.integer(y_test)))
+  )
+
+  best_iter <- attr(selected_model, "best_iteration")
+  if (is.null(best_iter)) best_iter <- 2000L
+
+  # Final refit on all observed-income rows using the chosen feature set
+  x_obs_sel <- x_obs[, selected_features, drop = FALSE]
+  x_obs_sel <- align_to_template(x_obs_sel, x_train_sel)
+  dall <- xgb.DMatrix(x_obs_sel, label = as.integer(y_obs) - 1L)
+
+  final_model <- xgb.train(
+    params = params,
+    data = dall,
+    nrounds = best_iter,
+    verbose = 0
+  )
+
+  list(
+    model = final_model,
+    income_col = income_col,
+    income_levels = income_levels,
+    selected_features = selected_features,
+    feature_importance = imp,
+    metrics = metrics,
+    confusion = table(truth = y_test, pred = pred_test),
+    x_template = x_obs_sel
+  )
+}
+
+impute_income_bracket <- function(new_df, fit, m = 1, stochastic = TRUE, seed = 42) {
+  dat <- coerce_xgb_types(new_df)
+
+  if (!fit$income_col %in% names(dat)) {
+    dat[[fit$income_col]] <- NA
+  }
+
+  dat[[fit$income_col]] <- factor(
+    dat[[fit$income_col]],
+    levels = fit$income_levels,
+    ordered = TRUE
+  )
+
+  missing_income <- is.na(dat[[fit$income_col]])
+  if (!any(missing_income)) {
+    return(if (m == 1L) dat else replicate(m, dat, simplify = FALSE))
+  }
+
+  x_new <- align_to_template(dat, fit$x_template)
+  dmiss <- xgb.DMatrix(x_new[missing_income, , drop = FALSE])
+
+  prob <- as_prob_matrix(
+    predict(fit$model, dmiss),
+    nclass = length(fit$income_levels)
+  )
+
+  hard_class <- factor(
+    fit$income_levels[max.col(prob, ties.method = "first")],
+    levels = fit$income_levels,
+    ordered = TRUE
+  )
+
+  point_imputed <- dat
+  point_imputed[[fit$income_col]][missing_income] <- hard_class
+
+  if (m == 1L || !stochastic) {
+    return(point_imputed)
+  }
+
+  set.seed(seed)
+  out <- vector("list", m)
+
+  for (i in seq_len(m)) {
+    draw_idx <- apply(prob, 1, function(p) {
+      p <- p / sum(p)
+      sample.int(length(p), size = 1L, prob = p)
+    })
+
+    draw_class <- factor(
+      fit$income_levels[draw_idx],
+      levels = fit$income_levels,
+      ordered = TRUE
+    )
+
+    tmp <- dat
+    tmp[[fit$income_col]][missing_income] <- draw_class
+    out[[i]] <- tmp
+  }
+
+  out
+}
+```
+
+
+Clean up my data
+```{r}
+# person_id | question              | answer
+# 1001          | age                        | 34
+# 1001          | highest_education_level    | Bachelor's degree
+# 1001          | annual_household_income    | 50k 75k
+# 1002          | age                        | 51
+
+survey_aou_clean <- survey_aou |>
+  dplyr::select(person_id,
+                question,
+                answer)
+
+
+first_non_missing <- function(x) {
+  x <- trimws(as.character(x))
+  x <- x[!is.na(x) & x != ""]
+  if (length(x) == 0L) NA_character_ else x[1]
+}
+
+to_binary_int <- function(x) {
+  x <- tolower(trimws(as.character(x)))
+  case_when(
+    x %in% c("1", "yes", "y", "true", "checked", "selected") ~ 1L,
+    x %in% c("0", "no", "n", "false", "unchecked", "not selected") ~ 0L,
+    TRUE ~ NA_integer_
+  )
+}
+
+survey_long_to_wide <- function(
+  long_df,
+  id_col = "person_id",
+  question_col = "question",
+  answer_col = "answer",
+  keep_cols = character(),   # e.g. weights/strata/psu if repeated on each row
+  missing_tokens = c(
+    "", "NA", "N/A", "Skipped", "Refused",
+    "Don't know", "Prefer not to answer"
+  ),
+  numeric_questions = character(),
+  binary_questions = character(),
+  ordered_questions = list(),
+  dedupe = c("error", "first_non_missing", "collapse")
+) {
+  dedupe <- match.arg(dedupe)
+
+  df <- long_df %>%
+    mutate(
+      .id = .data[[id_col]],
+      .question = as.character(.data[[question_col]]),
+      .answer = trimws(as.character(.data[[answer_col]])),
+      .answer = ifelse(.answer %in% missing_tokens, NA_character_, .answer)
+    ) %>%
+    select(all_of(keep_cols), .id, .question, .answer)
+
+  duplicates <- df %>%
+    count(.id, .question, name = "n") %>%
+    filter(n > 1)
+
+  if (nrow(duplicates) > 0 && dedupe == "error") {
+    stop(
+      "Found duplicate respondent/question pairs. Inspect `duplicates` ",
+      "or rerun with dedupe = 'first_non_missing' or 'collapse'."
+    )
+  }
+
+  values_fun <- switch(
+    dedupe,
+    error = NULL,
+    first_non_missing = list(.answer = first_non_missing),
+    collapse = list(.answer = ~ paste(unique(stats::na.omit(.x)), collapse = " | "))
+  )
+
+  wide <- df %>%
+    pivot_wider(
+      id_cols = c(all_of(keep_cols), .id),
+      names_from = .question,
+      values_from = .answer,
+      values_fill = NA_character_,
+      values_fn = values_fun
+    ) %>%
+    rename(person_id = .id)
+
+  if (length(numeric_questions) > 0) {
+    wide <- wide %>%
+      mutate(across(any_of(numeric_questions), ~ suppressWarnings(as.numeric(.x))))
+  }
+
+  if (length(binary_questions) > 0) {
+    wide <- wide %>%
+      mutate(across(any_of(binary_questions), to_binary_int))
+  }
+
+  if (length(ordered_questions) > 0) {
+    for (nm in names(ordered_questions)) {
+      if (nm %in% names(wide)) {
+        wide[[nm]] <- factor(
+          wide[[nm]],
+          levels = ordered_questions[[nm]],
+          ordered = TRUE
+        )
+      }
+    }
+  }
+
+  list(
+    wide = wide,
+    duplicates = duplicates
+  )
+}
+
+income_levels <- c(
+  "less 10k", "10k 25k", "25k 35k", "35k 50k",
+  "50k 75k", "75k 100k", "100k 150k", "more 200k"
+)
+
+edu_levels <- c("Never Attended",
+                "One Through Four",
+                "Five Through Eight",
+                "Nine Through Eleven",
+                "Twelve Or GED",
+                "College One to Three",
+                "College Graduate",
+                "Advanced Degree")
+
+pool_prep <- survey_long_to_wide(
+  long_df = survey_aou_clean,
+  id_col = "person_id",
+  question_col = "question",
+  answer_col = "answer",
+  keep_cols = c("survey_weight", "strata", "psu"),  # only if these repeat per row
+  numeric_questions = c("age", "household_size", "num_children"),
+  binary_questions = c("employed", "married", "has_children"),
+  ordered_questions = list(
+    highest_education_level = edu_levels,
+    annual_household_income = income_levels
+  ),
+  dedupe = "error"
+)
+
+wide_pool_df <- pool_prep$wide
+
+# Inspect this if the function stops:
+pool_prep$duplicates
+
+fit <- fit_income_bracket_imputer(
+  pool_df = wide_pool_df,
+  income_col = "annual_household_income",
+  income_levels = income_levels,
+  exclude_cols = c("person_id")
+)
+
+mi_5k <- impute_income_bracket(
+  new_df = wide_5k_df,
+  fit = fit,
+  m = 5,
+  stochastic = TRUE,
+  seed = 42
+)
+
+multi_select_wide <- multi_select_long %>%
+  mutate(selected = 1L) %>%
+  pivot_wider(
+    id_cols = person_id,
+    names_from = c(question, option_code),
+    values_from = selected,
+    values_fill = 0L
+  )
+
+wide_pool_df <- wide_pool_df %>%
+  left_join(multi_select_wide, "person_id")
+```
+
+
+
+run the imputation
+```{r}
+
+# If your real instrument has a "150k 200k" bucket, add it here in order.
+income_levels <- c(
+  "less 10k", "10k 25k", "25k 35k", "35k 50k",
+  "50k 75k", "75k 100k", "100k 150k", "150k 200k", "more 200k"
+)
+
+
+fit <- fit_income_bracket_imputer(
+  pool_df = study_pool_df,
+  income_col = "annual_household_income",
+  income_levels = income_levels,
+  exclude_cols = c(
+    "person_id",
+    "free_text_comment"
+    # add anything derived from income itself
+  ),
+  top_k = 80,
+  seed = 42
+)
+
+fit$metrics
+head(fit$feature_importance, 20)
+fit$confusion
+
+# Deterministic single imputation
+imputed_5k <- impute_income_bracket(
+  new_df = analytic_5k_df,
+  fit = fit,
+  m = 1
+)
+
+# 5 stochastic completed datasets
+mi_5k <- impute_income_bracket(
+  new_df = analytic_5k_df,
+  fit = fit,
+  m = 5,
+  stochastic = TRUE,
+  seed = 42
+)
+```
+
