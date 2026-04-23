@@ -15,6 +15,9 @@ library(stringr)
 library(tidyverse)
 library(ggplot2)
 library(broom)
+
+#we are using git remote set-url origin git@github.com:USERNAME/REPOSITORY.git
+#to get git to use ssh key?
 ```
 
 ```{r handling function}
