@@ -8,3 +8,5 @@ do saved credentials work?
 
 
 doublecheck pull, even mid-project
+
+make some changes from the google bucket version of the project
